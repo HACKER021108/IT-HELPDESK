@@ -93,9 +93,9 @@
     "issueDesc": "nothing",
     "expectedDays": 3,
     "assignedTo": "Ashish",
-    "status": "Pending",
+    "status": "In Progress",
     "createdDate": "2/2/2026, 5:05:02 pm",
-    "updatedDate": "2/2/2026, 5:05:02 pm",
+    "updatedDate": "2/2/2026, 5:07:14 pm",
     "type": "software",
     "attachment": null,
     "inProgressReasons": ""
