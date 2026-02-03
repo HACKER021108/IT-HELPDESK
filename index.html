@@ -604,6 +604,96 @@
         let currentMode = null;
         let currentSha = null;
         let transferringIssueId = null;
+        
+        // ================= PERFORMANCE OPTIMIZATION =================
+        // Cache management
+        const CACHE_TTL = 30000; // 30 seconds cache
+        let issuesCache = null;
+        let cacheTimestamp = 0;
+        let pendingRequests = new Map(); // Prevent duplicate concurrent requests
+        let debounceTimers = {};
+        
+        // Request queue for rate limiting
+        const requestQueue = {
+            queue: [],
+            processing: false,
+            maxConcurrent: 3,
+            activeRequests: 0
+        };
+        
+        async function queueRequest(fn) {
+            return new Promise((resolve, reject) => {
+                requestQueue.queue.push({ fn, resolve, reject });
+                processQueue();
+            });
+        }
+        
+        async function processQueue() {
+            if (requestQueue.processing || requestQueue.queue.length === 0) return;
+            
+            while (requestQueue.activeRequests < requestQueue.maxConcurrent && requestQueue.queue.length > 0) {
+                requestQueue.processing = true;
+                requestQueue.activeRequests++;
+                
+                const { fn, resolve, reject } = requestQueue.queue.shift();
+                
+                try {
+                    const result = await fn();
+                    resolve(result);
+                } catch (error) {
+                    reject(error);
+                } finally {
+                    requestQueue.activeRequests--;
+                    if (requestQueue.queue.length === 0) {
+                        requestQueue.processing = false;
+                    } else {
+                        processQueue();
+                    }
+                }
+            }
+        }
+        
+        // Cache utility functions
+        function getCachedIssues() {
+            if (issuesCache && (Date.now() - cacheTimestamp) < CACHE_TTL) {
+                return issuesCache;
+            }
+            return null;
+        }
+        
+        function setCachedIssues(issues) {
+            issuesCache = issues;
+            cacheTimestamp = Date.now();
+            // Also save to localStorage as backup
+            try {
+                localStorage.setItem('issues_cache', JSON.stringify({
+                    data: issues,
+                    timestamp: cacheTimestamp
+                }));
+            } catch (e) {
+                console.warn('LocalStorage quota exceeded, using memory cache only');
+            }
+        }
+        
+        function getLocalStorageIssues() {
+            try {
+                const cached = localStorage.getItem('issues_cache');
+                if (cached) {
+                    return JSON.parse(cached);
+                }
+            } catch (e) {
+                console.warn('Error reading localStorage cache');
+            }
+            return null;
+        }
+        
+        // Debounce helper
+        function debounce(key, fn, delay = 500) {
+            if (debounceTimers[key]) {
+                clearTimeout(debounceTimers[key]);
+            }
+            debounceTimers[key] = setTimeout(fn, delay);
+        }
 
         // ================= GITHUB CONFIGURATION =================
         // ⚠️ REPLACE THESE WITH YOUR DETAILS
@@ -618,34 +708,72 @@
 
         // ================= GITHUB API FUNCTIONS =================
         async function getIssues() {
-            try {
-                // Direct GitHub API call
-                const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/issues.json`;
-                const response = await fetch(url, {
-                    headers: {
-                        'Authorization': `token ${GITHUB_TOKEN}`,
-                        'Accept': 'application/vnd.github.v3+json'
-                    },
-                    cache: "no-store"
-                });
-
-                if (response.status === 404) return []; // File doesn't exist yet
-
-                if (!response.ok) {
-                    console.error('API Error:', response.status);
-                    return [];
-                }
-
-                const content = await response.json();
-                currentSha = content.sha; // Save SHA for updates
-                
-                // Decode Base64 content
-                const decodedContent = decodeURIComponent(escape(atob(content.content)));
-                return JSON.parse(decodedContent);
-            } catch (error) {
-                console.error('Error fetching issues:', error);
-                return [];
+            // Check cache first
+            const cachedIssues = getCachedIssues();
+            if (cachedIssues) {
+                return cachedIssues;
             }
+            
+            // Check for pending request to avoid duplicate calls
+            if (pendingRequests.has('getIssues')) {
+                return pendingRequests.get('getIssues');
+            }
+            
+            // Queue the actual request
+            const requestPromise = queueRequest(async () => {
+                try {
+                    // Check cache again in case another request just completed
+                    const cachedIssues = getCachedIssues();
+                    if (cachedIssues) {
+                        return cachedIssues;
+                    }
+                    
+                    const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/issues.json`;
+                    const response = await fetch(url, {
+                        headers: {
+                            'Authorization': `token ${GITHUB_TOKEN}`,
+                            'Accept': 'application/vnd.github.v3+json'
+                        },
+                        cache: "no-store"
+                    });
+
+                    if (response.status === 404) {
+                        setCachedIssues([]);
+                        return [];
+                    }
+
+                    if (response.status === 403) {
+                        // Rate limited
+                        console.warn('GitHub API rate limited, using cached data');
+                        const localData = getLocalStorageIssues();
+                        return localData ? localData.data : [];
+                    }
+
+                    if (!response.ok) {
+                        console.error('API Error:', response.status);
+                        const localData = getLocalStorageIssues();
+                        return localData ? localData.data : [];
+                    }
+
+                    const content = await response.json();
+                    currentSha = content.sha;
+                    
+                    const decodedContent = decodeURIComponent(escape(atob(content.content)));
+                    const issues = JSON.parse(decodedContent);
+                    setCachedIssues(issues);
+                    return issues;
+                } catch (error) {
+                    console.error('Error fetching issues:', error);
+                    // Fallback to localStorage
+                    const localData = getLocalStorageIssues();
+                    return localData ? localData.data : [];
+                }
+            });
+            
+            pendingRequests.set('getIssues', requestPromise);
+            const result = await requestPromise;
+            pendingRequests.delete('getIssues');
+            return result;
         }
 
         async function uploadAttachmentToGithub(file, issueId) {
@@ -758,6 +886,10 @@
 
         async function saveToGithub(issues) {
             try {
+                // Invalidate cache before saving
+                issuesCache = null;
+                cacheTimestamp = 0;
+                
                 const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/issues.json`;
                 
                 // Encode content to Base64
@@ -781,6 +913,14 @@
                     body: JSON.stringify(body)
                 });
 
+                if (response.status === 409) {
+                    // Conflict - refresh SHA and retry once
+                    const freshIssues = await getIssues();
+                    issuesCache = null;
+                    cacheTimestamp = 0;
+                    return;
+                }
+
                 if (!response.ok) {
                     const error = await response.json();
                     console.error('API Save Error:', error);
@@ -788,7 +928,10 @@
                 }
 
                 const data = await response.json();
-                currentSha = data.content.sha; // Update SHA
+                currentSha = data.content.sha;
+                
+                // Update cache after successful save
+                setCachedIssues(issues);
                 return true;
             } catch (error) {
                 console.error('Error saving to GitHub:', error);
@@ -803,12 +946,22 @@
         }
 
         async function updateIssue(updatedIssue) {
-            const issues = await getIssues();
-            const index = issues.findIndex(i => i.id === updatedIssue.id);
-            if (index !== -1) {
-                issues[index] = updatedIssue;
-                await saveToGithub(issues);
-            }
+            // Use debouncing to prevent rapid successive updates
+            return new Promise((resolve, reject) => {
+                debounce(`update_${updatedIssue.id}`, async () => {
+                    try {
+                        const issues = await getIssues();
+                        const index = issues.findIndex(i => i.id === updatedIssue.id);
+                        if (index !== -1) {
+                            issues[index] = updatedIssue;
+                            await saveToGithub(issues);
+                        }
+                        resolve();
+                    } catch (error) {
+                        reject(error);
+                    }
+                }, 300);
+            });
         }
 
         async function deleteIssue(id) {
@@ -1104,79 +1257,91 @@
         // ================= DISPLAY ISSUES =================
         async function displayIssues() {
             const list = document.getElementById('issuesList');
-            list.innerHTML = '<p style="text-align: center;">Loading...</p>';
+            
+            // Use debouncing to prevent rapid re-renders
+            debounce('displayIssues', async () => {
+                try {
+                    let allIssues = await loadAllIssues();
+                    let filteredIssues = allIssues;
 
-            let allIssues = await loadAllIssues();
-            let filteredIssues = allIssues;
+                    if (currentMode === 'tech') {
+                        filteredIssues = allIssues.filter(i => i.assignedTo === currentUser);
+                    }
 
-            if (currentMode === 'tech') {
-                filteredIssues = allIssues.filter(i => i.assignedTo === currentUser);
-            }
+                    list.innerHTML = '';
 
-            list.innerHTML = '';
+                    if (filteredIssues.length === 0) {
+                        list.innerHTML = '<div style="text-align: center; padding: 2rem; color: #666;"><h3>📭 No issues</h3></div>';
+                        return;
+                    }
 
-            if (filteredIssues.length === 0) {
-                list.innerHTML = '<div style="text-align: center; padding: 2rem; color: #666;"><h3>📭 No issues</h3></div>';
-                return;
-            }
-
-            filteredIssues.forEach(issue => {
-                const card = document.createElement('div');
-                card.className = 'issue-card';
-                card.innerHTML = `
-                    <div class="issue-header">
-                        <div class="issue-id">#${issue.id.toString().slice(-6)}</div>
-                        <span class="status-badge status-${issue.status.toLowerCase()}">${issue.status}</span>
-                    </div>
-                    <div style="margin-bottom: 1rem;">
-                        <strong style="background: linear-gradient(45deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">📍 ${issue.placeOfIssue}</strong>
-                    </div>
-                    <p><strong>📝 ${issue.issueDesc}</strong></p>
-                    <div style="display: flex; gap: 2rem; font-size: 14px; color: #666; flex-wrap: wrap;">
-                        <span>👤 ${issue.filedBy}</span>
-                        <span>👨‍💼 ${issue.assignedTo}</span>
-                        <span>⏱️ ${issue.expectedDays} days</span>
-                        <span>📅 ${issue.createdDate}</span>
-                    </div>
-                    ${issue.attachment ? `
-                        <div style="margin-top: 1rem; padding: 1rem; background: #e8f4f8; border-radius: 12px; border-left: 4px solid #17a2b8;">
-                            <div style="font-weight: bold; color: #17a2b8; font-size: 13px; margin-bottom: 0.5rem;">📎 Attachment</div>
-                            <div style="font-size: 12px; color: #555; margin-bottom: 0.5rem;">
-                                <a href="${issue.attachment.url}" target="_blank" style="color: #17a2b8; text-decoration: none;">📥 ${issue.attachment.name}</a>
-                                <span style="color: #999; font-size: 11px;"> (${(issue.attachment.size / 1024 / 1024).toFixed(2)}MB)</span>
+                    // Use DocumentFragment for better performance
+                    const fragment = document.createDocumentFragment();
+                    
+                    filteredIssues.forEach(issue => {
+                        const card = document.createElement('div');
+                        card.className = 'issue-card';
+                        card.innerHTML = `
+                            <div class="issue-header">
+                                <div class="issue-id">#${issue.id.toString().slice(-6)}</div>
+                                <span class="status-badge status-${issue.status.toLowerCase()}">${issue.status}</span>
                             </div>
-                            ${issue.attachment.type.startsWith('image/') ? `
-                                <img src="${issue.attachment.url}" style="max-width: 150px; max-height: 150px; border-radius: 6px;" onerror="this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22150%22 height=%22150%22%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22%3EImage%3C/text%3E%3C/svg%3E'">
-                            ` : issue.attachment.type.startsWith('video/') ? `
-                                <video style="max-width: 200px; max-height: 200px; border-radius: 6px;" controls><source src="${issue.attachment.url}" type="${issue.attachment.type}"></video>
-                            ` : `
-                                <a href="${issue.attachment.url}" target="_blank" class="btn btn-info btn-action">📥 Download File</a>
-                            `}
-                        </div>
-                    ` : ''}
-                    <div style="margin-top: 1rem; padding: 1rem; background: #f9f9f9; border-radius: 12px; border-left: 4px solid #667eea;">
-                        <div style="font-weight: bold; color: #667eea; font-size: 13px; margin-bottom: 0.5rem;">⏳ In Progress Reasons</div>
-                        <textarea class="solver-notes-textarea" id="reasons${issue.id}" style="min-height: 80px; margin-bottom: 0.5rem;" placeholder="e.g., Waiting for parts...">${issue.inProgressReasons || ''}</textarea>
-                        ${(currentMode === 'tech' || currentMode === 'admin') ? `
-                            <button class="btn btn-primary btn-action" style="width: 100%; padding: 8px;" onclick="saveInProgressReasons(${issue.id})">💾 Save</button>
-                        ` : `
-                            <div style="font-size: 13px; color: #666; font-style: italic;">${issue.inProgressReasons ? issue.inProgressReasons : 'No reasons added yet'}</div>
-                        `}
-                    </div>
-                    ${(currentMode === 'tech' || currentMode === 'admin') ? `
-                        <div style="margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                            <button class="btn btn-secondary btn-action" onclick="viewDescription(${issue.id})">📄 View</button>
-                            ${issue.status === 'Pending' ? `<button class="btn btn-success btn-action" onclick="updateStatus(${issue.id}, 'In Progress')">🔄 Progress</button>` : ''}
-                            ${issue.status !== 'Solved' ? `<button class="btn btn-primary btn-action" onclick="updateStatus(${issue.id}, 'Solved')">✅ Solve</button>` : `<span class="status-badge status-solved">✅ SOLVED</span>`}
-                            <input type="number" id="days${issue.id}" min="1" max="30" placeholder="Days" style="width: 70px; padding: 8px; border-radius: 8px; border: 1px solid #ddd;">
-                            <button class="btn btn-warning btn-action" onclick="updateDuration(${issue.id})">⏱️ Update</button>
-                            <button class="btn btn-info btn-action" onclick="openTransferModal(${issue.id})">🔄 Transfer</button>
-                            <button class="btn btn-danger btn-action" onclick="deleteIssueFunc(${issue.id})">🗑️ Delete</button>
-                        </div>
-                    ` : ''}
-                `;
-                list.appendChild(card);
-            });
+                            <div style="margin-bottom: 1rem;">
+                                <strong style="background: linear-gradient(45deg, #667eea, #764ba2); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">📍 ${issue.placeOfIssue}</strong>
+                            </div>
+                            <p><strong>📝 ${issue.issueDesc}</strong></p>
+                            <div style="display: flex; gap: 2rem; font-size: 14px; color: #666; flex-wrap: wrap;">
+                                <span>👤 ${issue.filedBy}</span>
+                                <span>👨‍💼 ${issue.assignedTo}</span>
+                                <span>⏱️ ${issue.expectedDays} days</span>
+                                <span>📅 ${issue.createdDate}</span>
+                            </div>
+                            ${issue.attachment ? `
+                                <div style="margin-top: 1rem; padding: 1rem; background: #e8f4f8; border-radius: 12px; border-left: 4px solid #17a2b8;">
+                                    <div style="font-weight: bold; color: #17a2b8; font-size: 13px; margin-bottom: 0.5rem;">📎 Attachment</div>
+                                    <div style="font-size: 12px; color: #555; margin-bottom: 0.5rem;">
+                                        <a href="${issue.attachment.url}" target="_blank" style="color: #17a2b8; text-decoration: none;">📥 ${issue.attachment.name}</a>
+                                        <span style="color: #999; font-size: 11px;"> (${(issue.attachment.size / 1024 / 1024).toFixed(2)}MB)</span>
+                                    </div>
+                                    ${issue.attachment.type.startsWith('image/') ? `
+                                        <img src="${issue.attachment.url}" style="max-width: 150px; max-height: 150px; border-radius: 6px;" onerror="this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22150%22 height=%22150%22%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22%3EImage%3C/text%3E%3C/svg%3E'">
+                                    ` : issue.attachment.type.startsWith('video/') ? `
+                                        <video style="max-width: 200px; max-height: 200px; border-radius: 6px;" controls><source src="${issue.attachment.url}" type="${issue.attachment.type}"></video>
+                                    ` : `
+                                        <a href="${issue.attachment.url}" target="_blank" class="btn btn-info btn-action">📥 Download File</a>
+                                    `}
+                                </div>
+                            ` : ''}
+                            <div style="margin-top: 1rem; padding: 1rem; background: #f9f9f9; border-radius: 12px; border-left: 4px solid #667eea;">
+                                <div style="font-weight: bold; color: #667eea; font-size: 13px; margin-bottom: 0.5rem;">⏳ In Progress Reasons</div>
+                                <textarea class="solver-notes-textarea" id="reasons${issue.id}" style="min-height: 80px; margin-bottom: 0.5rem;" placeholder="e.g., Waiting for parts...">${issue.inProgressReasons || ''}</textarea>
+                                ${(currentMode === 'tech' || currentMode === 'admin') ? `
+                                    <button class="btn btn-primary btn-action" style="width: 100%; padding: 8px;" onclick="saveInProgressReasons(${issue.id})">💾 Save</button>
+                                ` : `
+                                    <div style="font-size: 13px; color: #666; font-style: italic;">${issue.inProgressReasons ? issue.inProgressReasons : 'No reasons added yet'}</div>
+                                `}
+                            </div>
+                            ${(currentMode === 'tech' || currentMode === 'admin') ? `
+                                <div style="margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                                    <button class="btn btn-secondary btn-action" onclick="viewDescription(${issue.id})">📄 View</button>
+                                    ${issue.status === 'Pending' ? `<button class="btn btn-success btn-action" onclick="updateStatus(${issue.id}, 'In Progress')">🔄 Progress</button>` : ''}
+                                    ${issue.status !== 'Solved' ? `<button class="btn btn-primary btn-action" onclick="updateStatus(${issue.id}, 'Solved')">✅ Solve</button>` : `<span class="status-badge status-solved">✅ SOLVED</span>`}
+                                    <input type="number" id="days${issue.id}" min="1" max="30" placeholder="Days" style="width: 70px; padding: 8px; border-radius: 8px; border: 1px solid #ddd;">
+                                    <button class="btn btn-warning btn-action" onclick="updateDuration(${issue.id})">⏱️ Update</button>
+                                    <button class="btn btn-info btn-action" onclick="openTransferModal(${issue.id})">🔄 Transfer</button>
+                                    <button class="btn btn-danger btn-action" onclick="deleteIssueFunc(${issue.id})">🗑️ Delete</button>
+                                </div>
+                            ` : ''}
+                        `;
+                        fragment.appendChild(card);
+                    });
+                    
+                    list.appendChild(fragment);
+                } catch (error) {
+                    console.error('Error displaying issues:', error);
+                    list.innerHTML = '<div style="text-align: center; padding: 2rem; color: #dc3545;"><p>⚠️ Error loading issues. Please refresh.</p></div>';
+                }
+            }, 200);
         }
 
         // ================= ISSUE MANAGEMENT =================
@@ -1302,19 +1467,26 @@
 
         // ================= STATISTICS =================
         async function updateStats() {
-            const allIssues = await loadAllIssues();
-            let relevantIssues = allIssues;
-            if (currentMode === 'tech') {
-                relevantIssues = allIssues.filter(i => i.assignedTo === currentUser);
-            }
+            // Debounce stats updates to prevent rapid re-renders
+            debounce('updateStats', async () => {
+                try {
+                    const allIssues = await loadAllIssues();
+                    let relevantIssues = allIssues;
+                    if (currentMode === 'tech') {
+                        relevantIssues = allIssues.filter(i => i.assignedTo === currentUser);
+                    }
 
-            const total = relevantIssues.length;
-            const solved = relevantIssues.filter(i => i.status === 'Solved').length;
-            const pending = relevantIssues.filter(i => i.status === 'Pending').length;
+                    const total = relevantIssues.length;
+                    const solved = relevantIssues.filter(i => i.status === 'Solved').length;
+                    const pending = relevantIssues.filter(i => i.status === 'Pending').length;
 
-            document.getElementById('totalIssues').textContent = total;
-            document.getElementById('solvedIssues').textContent = solved;
-            document.getElementById('pendingIssues').textContent = pending;
+                    document.getElementById('totalIssues').textContent = total;
+                    document.getElementById('solvedIssues').textContent = solved;
+                    document.getElementById('pendingIssues').textContent = pending;
+                } catch (error) {
+                    console.error('Error updating stats:', error);
+                }
+            }, 200);
         }
 
         // ================= PDF REPORTS =================
